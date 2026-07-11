@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+import autoclip.bot as bot_module
 from autoclip.bot import (
     _extract_youtube_url,
     _generate_job_id,
@@ -44,9 +45,11 @@ class _FakeMessage:
         self.chat = _FakeChat(chat_id)
         self.bot = None
         self.answers: list[str] = []
+        self.answer_kwargs: list[dict[str, Any]] = []
 
     async def answer(self, text: str, **kwargs: Any) -> _FakeSentMessage:
         self.answers.append(text)
+        self.answer_kwargs.append(kwargs)
         return _FakeSentMessage()
 
 
@@ -137,7 +140,37 @@ async def test_handle_youtube_link_creates_job_and_replies(
     assert job.chat_id == 555
     assert job.user_id == 111
     assert job.job_id in message.answers[0]
-    assert "Menunggu" in message.answers[0]
+    assert "diterima" in message.answers[0]
+    assert message.answer_kwargs[0]["parse_mode"] == "HTML"
+
+
+async def test_handle_youtube_link_keeps_strong_reference_to_watch_task(
+    monkeypatch: pytest.MonkeyPatch, store: JobStore
+) -> None:
+    # asyncio.create_task() cuma menyimpan weak reference — tanpa disimpan di
+    # _background_tasks, task ini bisa di-GC di tengah jalan (bug asli yang
+    # bikin pesan Telegram berhenti ter-update walau job jalan terus).
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _blocking_watch(bot: Any, chat_id: int, message_id: int, job_id: str) -> None:
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr("autoclip.bot._watch_job", _blocking_watch)
+
+    message = _FakeMessage("tonton https://youtu.be/abc123 dong", user_id=111)
+
+    await handle_youtube_link(message)
+    await started.wait()
+
+    assert len(bot_module._background_tasks) == 1
+    task = next(iter(bot_module._background_tasks))
+
+    release.set()
+    await task  # tunggu task selesai betulan, baru done_callback membersihkannya
+
+    assert len(bot_module._background_tasks) == 0
 
 
 async def test_handle_youtube_link_ignores_message_without_url(store: JobStore) -> None:
@@ -164,7 +197,7 @@ async def test_cmd_status_reports_current_status(store: JobStore) -> None:
     await cmd_status(message)
 
     assert "job-1" in message.answers[0]
-    assert "Menunggu" in message.answers[0]
+    assert "Antre" in message.answers[0]
 
 
 async def test_cmd_status_missing_arg_prompts_usage(store: JobStore) -> None:
@@ -276,8 +309,10 @@ async def test_watch_job_polls_until_status_changes(
     await _watch_job(bot, chat_id=1, message_id=42, job_id="job-1")
 
     statuses_seen = [call["text"] for call in bot.edit_calls]
-    assert any("Menunggu" in text for text in statuses_seen)
-    assert any("Gagal" in text for text in statuses_seen)
+    assert any("🔄 Antre" in text for text in statuses_seen)
+    # Stage yang gagal (Antre, satu-satunya yang teramati) ditandai ❌
+    # langsung, bukan baris "Gagal" generik terpisah.
+    assert any("❌ Antre" in text and "gagal setelah nunggu" in text for text in statuses_seen)
 
 
 async def test_watch_job_does_not_reedit_on_unchanged_status(
@@ -297,6 +332,8 @@ async def test_watch_job_does_not_reedit_on_unchanged_status(
     bot = _FakeBot()
     await _watch_job(bot, chat_id=1, message_id=42, job_id="job-1")
 
-    # Status QUEUED cuma diedit sekali walau ada beberapa iterasi sebelum FAILED.
-    queued_edits = [c for c in bot.edit_calls if "Menunggu" in c["text"]]
-    assert len(queued_edits) == 1
+    # Timeline persisten di tiap edit (jadi "Antre" tetap muncul di pesan
+    # akhir juga) — yang penting jumlah edit-nya cuma sebanyak transisi
+    # NYATA (QUEUED -> FAILED = 2x), bukan bertambah tiap iterasi poll yang
+    # statusnya belum berubah.
+    assert len(bot.edit_calls) == 2

@@ -13,6 +13,7 @@ worker.py) dalam satu proses async.
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import re
 import uuid
@@ -25,7 +26,12 @@ from autoclip.config import get_settings
 from autoclip.db import JobNotFoundError, get_job_store
 from autoclip.models import ClipPlan, JobStatus
 from autoclip.pipeline.render import clip_output_path
-from autoclip.telegram_sender import format_status_message, send_clips, update_status_message
+from autoclip.telegram_sender import (
+    StageEvent,
+    format_status_message,
+    send_clips,
+    update_status_message,
+)
 from autoclip.worker import run_forever
 
 logger = logging.getLogger(__name__)
@@ -36,6 +42,13 @@ _YOUTUBE_URL_RE = re.compile(
 )
 
 _WATCH_POLL_INTERVAL_SECONDS = 3.0
+
+# asyncio.create_task() cuma menyimpan WEAK reference ke task-nya — tanpa
+# strong reference disimpan di tempat lain, task _watch_job bisa di-garbage-
+# collect kapan saja di tengah jalan (biasanya diam-diam, tanpa error apa
+# pun), bikin pesan Telegram berhenti ter-update walau job-nya sendiri
+# terus jalan normal di worker. Simpan reference-nya di sini sampai selesai.
+_background_tasks: set[asyncio.Task[None]] = set()
 
 
 def _is_user_allowed(user_id: int) -> bool:
@@ -74,12 +87,24 @@ async def handle_youtube_link(message: Message) -> None:
     store.create_job(job_id, url, chat_id=message.chat.id, user_id=user.id)
     logger.info("job_id=%s dibuat oleh user_id=%s untuk url=%s", job_id, user.id, url)
 
-    sent = await message.answer(format_status_message(job_id, JobStatus.QUEUED))
-    asyncio.create_task(_watch_job(message.bot, message.chat.id, sent.message_id, job_id))
+    # Pesan ini cuma placeholder — _watch_job langsung menimpanya dengan
+    # timeline lengkap begitu poll pertama mendeteksi status job.
+    sent = await message.answer(
+        f"🎬 Job <code>{html.escape(job_id)}</code> diterima, memulai...", parse_mode="HTML"
+    )
+    task = asyncio.create_task(_watch_job(message.bot, message.chat.id, sent.message_id, job_id))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
 
 
 async def cmd_status(message: Message) -> None:
-    """`/status <job_id>` — laporkan status job saat ini."""
+    """`/status <job_id>` — laporkan status job saat ini.
+
+    Cuma menampilkan SATU entri (status saat ini), bukan timeline lengkap —
+    `db.py` cuma menyimpan `updated_at` terakhir, bukan riwayat tiap
+    transisi. Timeline lengkap hanya tersedia lewat `_watch_job` yang
+    memantau job sejak awal.
+    """
     user = message.from_user
     if user is None or not _is_user_allowed(user.id):
         await message.answer("Kamu tidak diizinkan menggunakan bot ini.")
@@ -87,17 +112,22 @@ async def cmd_status(message: Message) -> None:
 
     job_id = _parse_command_arg(message.text or "")
     if job_id is None:
-        await message.answer("Pakai format: /status <job_id>")
+        await message.answer("Pakai format: /status &lt;job_id&gt;", parse_mode="HTML")
         return
 
     store = get_job_store()
     try:
         job = store.get_job(job_id)
     except JobNotFoundError:
-        await message.answer(f"Job `{job_id}` tidak ditemukan.")
+        await message.answer(
+            f"Job <code>{html.escape(job_id)}</code> tidak ditemukan.", parse_mode="HTML"
+        )
         return
 
-    await message.answer(format_status_message(job_id, job.status, job.error_message))
+    history = [StageEvent(job.status, job.updated_at.astimezone())]
+    await message.answer(
+        format_status_message(job_id, history, job.error_message), parse_mode="HTML"
+    )
 
 
 async def cmd_cancel(message: Message) -> None:
@@ -109,36 +139,42 @@ async def cmd_cancel(message: Message) -> None:
 
     job_id = _parse_command_arg(message.text or "")
     if job_id is None:
-        await message.answer("Pakai format: /cancel <job_id>")
+        await message.answer("Pakai format: /cancel &lt;job_id&gt;", parse_mode="HTML")
         return
 
     store = get_job_store()
     try:
         job = store.get_job(job_id)
     except JobNotFoundError:
-        await message.answer(f"Job `{job_id}` tidak ditemukan.")
+        await message.answer(
+            f"Job <code>{html.escape(job_id)}</code> tidak ditemukan.", parse_mode="HTML"
+        )
         return
 
     if job.status is not JobStatus.QUEUED:
         await message.answer(
-            f"Job `{job_id}` sudah {job.status.value}, tidak bisa dibatalkan lagi."
+            f"Job <code>{html.escape(job_id)}</code> sudah {job.status.value}, "
+            "tidak bisa dibatalkan lagi.",
+            parse_mode="HTML",
         )
         return
 
     store.update_status(job_id, JobStatus.FAILED, error_message="Dibatalkan oleh user")
-    await message.answer(f"Job `{job_id}` dibatalkan.")
+    await message.answer(f"Job <code>{html.escape(job_id)}</code> dibatalkan.", parse_mode="HTML")
 
 
 async def _watch_job(bot: Bot, chat_id: int, message_id: int, job_id: str) -> None:
-    """Polling status job, edit pesan konfirmasi tiap berubah, kirim klip saat DONE."""
+    """Polling status job, edit pesan timeline tiap status berubah, kirim klip saat DONE."""
     store = get_job_store()
+    history: list[StageEvent] = []
     last_status: JobStatus | None = None
 
     while True:
         job = store.get_job(job_id)
         if job.status != last_status:
+            history.append(StageEvent(job.status, job.updated_at.astimezone()))
             await update_status_message(
-                bot, chat_id, message_id, job_id, job.status, job.error_message
+                bot, chat_id, message_id, job_id, history, job.error_message
             )
             last_status = job.status
 
