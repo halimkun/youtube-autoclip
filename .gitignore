@@ -15,3 +15,7 @@ wheels/
 # Data & runtime artefak (lihat db.py/config.py untuk path helper)
 data/
 
+# Cachce & logs
+*.log
+.ruff_cache/
+.pytest_cache/
