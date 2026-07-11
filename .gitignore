@@ -1,0 +1,17 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Env & secrets
+.env
+
+# Data & runtime artefak (lihat db.py/config.py untuk path helper)
+data/
+

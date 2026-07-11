@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pytest:*)",
+      "Bash(ruff:*)",
+      "Bash(pip install:*)",
+      "Bash(ffmpeg:*)",
+      "Bash(ffprobe:*)",
+      "Bash(yt-dlp:*)",
+      "Bash(python -m autoclip:*)"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./data/jobs.db)",
+      "Bash(rm -rf:*)"
+    ]
+  },
+  "env": {
+    "PYTHONDONTWRITEBYTECODE": "1"
+  }
+}
