@@ -10,6 +10,7 @@ from autoclip.pipeline.facecrop import (
     CropWindow,
     FaceBox,
     YuNetFaceDetector,
+    _dominant_face_center_x,
     _sample_timestamps,
     compute_crop_window,
 )
@@ -37,6 +38,51 @@ class _FixedFaceDetector:
 class _NoFaceDetector:
     def detect(self, frame) -> list[FaceBox]:
         return []
+
+
+class _FixedTwoFaceDetector:
+    """Detektor tiruan: dua wajah tetap di posisi X berbeda tiap frame
+    (simulasi video split-screen dua pembicara bersebelahan)."""
+
+    def __init__(self, left_x: float, right_x: float, box_size: float = 100.0):
+        self._left_x = left_x
+        self._right_x = right_x
+        self._box_size = box_size
+
+    def detect(self, frame) -> list[FaceBox]:
+        return [
+            FaceBox(
+                x=self._left_x - self._box_size / 2,
+                y=0,
+                width=self._box_size,
+                height=self._box_size,
+            ),
+            FaceBox(
+                x=self._right_x - self._box_size / 2,
+                y=0,
+                width=self._box_size,
+                height=self._box_size,
+            ),
+        ]
+
+
+class _SplitScreenDetector:
+    """Detektor tiruan split-screen: wajah kiri terdeteksi di SETIAP sampel,
+    wajah kanan cuma sebagian (mis. sesekali menoleh) -- untuk menguji klaster
+    mana yang dianggap dominan."""
+
+    def __init__(self, dominant_x: float, secondary_x: float, secondary_every: int = 2):
+        self._dominant_x = dominant_x
+        self._secondary_x = secondary_x
+        self._secondary_every = secondary_every
+        self._call_count = 0
+
+    def detect(self, frame) -> list[FaceBox]:
+        self._call_count += 1
+        faces = [FaceBox(x=self._dominant_x - 50.0, y=0, width=100.0, height=100.0)]
+        if self._call_count % self._secondary_every == 0:
+            faces.append(FaceBox(x=self._secondary_x - 50.0, y=0, width=100.0, height=100.0))
+        return faces
 
 
 def test_sample_timestamps_returns_evenly_spaced_points_inside_range() -> None:
@@ -99,3 +145,51 @@ def test_yunet_face_detector_raises_when_model_missing(tmp_path: Path) -> None:
 def test_face_box_center_x() -> None:
     box = FaceBox(x=100.0, y=0.0, width=50.0, height=80.0)
     assert box.center_x == 125.0
+
+
+def test_dominant_face_center_x_returns_frame_center_when_no_faces() -> None:
+    assert _dominant_face_center_x([], crop_width=200, frame_width=640) == 320
+
+
+def test_dominant_face_center_x_averages_single_cluster() -> None:
+    # Satu wajah yang posisinya bergeser sedikit antar sampel -- tetap satu
+    # klaster (celahnya jauh di bawah crop_width), jadi dirata-ratakan seperti biasa.
+    assert _dominant_face_center_x([100.0, 120.0, 140.0], crop_width=200, frame_width=640) == 120.0
+
+
+def test_dominant_face_center_x_picks_larger_cluster_in_split_screen() -> None:
+    # Celah antara klaster kiri (~100) dan kanan (500) = 360, lebih lebar dari
+    # crop_width 200 -> tidak mungkin muat sekaligus, harus dianggap 2 klaster
+    # terpisah. Klaster kiri terdeteksi 3x, kanan cuma 1x -> pakai klaster kiri.
+    center_xs = [95.0, 100.0, 105.0, 500.0]
+    assert _dominant_face_center_x(center_xs, crop_width=200, frame_width=640) == 100.0
+
+
+def test_dominant_face_center_x_breaks_tie_by_leftmost_cluster() -> None:
+    center_xs = [100.0, 500.0]
+    assert _dominant_face_center_x(center_xs, crop_width=200, frame_width=640) == 100.0
+
+
+def test_compute_crop_window_picks_dominant_cluster_in_split_screen(sample_video: Path) -> None:
+    # Kasus nyata yang dilaporkan: video split-screen 2 pembicara. Merata-
+    # ratakan center_x kedua wajah akan jatuh di garis pemisah (~300) dan
+    # memotong kedua wajah jadi setengah-setengah. Wajah kiri (x=100) terdeteksi
+    # di SETIAP sampel, wajah kanan (x=500) cuma separuhnya -- crop harus
+    # mengunci ke wajah kiri yang dominan, bukan ke titik tengah keduanya.
+    detector = _SplitScreenDetector(dominant_x=100.0, secondary_x=500.0, secondary_every=2)
+
+    window = compute_crop_window(sample_video, 0.5, 2.5, detector=detector, sample_count=5)
+
+    assert window.x == max(0, round(100.0 - window.width / 2))
+
+
+def test_compute_crop_window_breaks_tie_by_leftmost_face_in_split_screen(
+    sample_video: Path,
+) -> None:
+    # Kedua wajah terdeteksi sama banyak (seri) -- pilih klaster paling kiri
+    # secara deterministik, bukan rata-rata keduanya yang jatuh di garis pemisah.
+    detector = _FixedTwoFaceDetector(left_x=100.0, right_x=500.0)
+
+    window = compute_crop_window(sample_video, 0.5, 2.5, detector=detector)
+
+    assert window.x == max(0, round(100.0 - window.width / 2))

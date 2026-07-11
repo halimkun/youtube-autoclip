@@ -108,12 +108,41 @@ def compute_crop_window(
         capture.release()
 
     crop_width = min(round(frame_height * 9 / 16), frame_width)
-    face_center_x = sum(center_xs) / len(center_xs) if center_xs else frame_width / 2
+    face_center_x = _dominant_face_center_x(center_xs, crop_width, frame_width)
 
     x = round(face_center_x - crop_width / 2)
     x = max(0, min(x, frame_width - crop_width))
 
     return CropWindow(x=x, y=0, width=crop_width, height=frame_height)
+
+
+def _dominant_face_center_x(center_xs: list[float], crop_width: int, frame_width: int) -> float:
+    """Rata-ratakan posisi X wajah dari klaster TERBANYAK saja, bukan semua wajah
+    tercampur jadi satu rata-rata.
+
+    Video split-screen (2 pembicara bersebelahan) mendeteksi dua wajah yang
+    letaknya jauh terpisah di tiap frame. Merata-ratakan semuanya menghasilkan
+    titik tengah PERSIS DI GARIS PEMISAH split screen, bukan di salah satu
+    wajah -- crop 9:16 di titik itu malah memotong kedua wajah jadi
+    setengah-setengah (bug nyata yang pernah terjadi). Kelompokkan dulu posisi
+    wajah berdasarkan celah X: dianggap wajah berbeda kalau jaraknya lebih
+    lebar dari crop_width, karena keduanya memang tidak mungkin muat dalam
+    satu crop window sekaligus. Lalu pakai klaster dengan jumlah deteksi
+    terbanyak (pembicara paling sering terdeteksi di sampel frame).
+    """
+    if not center_xs:
+        return frame_width / 2
+
+    sorted_xs = sorted(center_xs)
+    clusters: list[list[float]] = [[sorted_xs[0]]]
+    for value in sorted_xs[1:]:
+        if value - clusters[-1][-1] > crop_width:
+            clusters.append([value])
+        else:
+            clusters[-1].append(value)
+
+    dominant = max(clusters, key=len)
+    return sum(dominant) / len(dominant)
 
 
 def _sample_timestamps(start: float, end: float, count: int) -> list[float]:

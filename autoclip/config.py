@@ -78,6 +78,11 @@ class Settings(BaseSettings):
     def plan_path(self, job_id: str) -> Path:
         return self.job_dir(job_id) / "plan.json"
 
+    def llm_attempt_path(self, job_id: str, attempt: int) -> Path:
+        """Path debug: raw respons LLM yang gagal validasi Pydantic, ditulis
+        per percobaan supaya bisa didiagnosis kalau retry habis tanpa hasil."""
+        return self.job_dir(job_id) / f"llm_attempt_{attempt}.txt"
+
     def clips_dir(self, job_id: str) -> Path:
         return self.job_dir(job_id) / "clips"
 

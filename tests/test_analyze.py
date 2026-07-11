@@ -183,6 +183,66 @@ async def test_analyze_transcript_raises_after_max_attempts(
     assert len(calls) == 3
 
 
+async def test_analyze_transcript_tells_llm_the_actual_duration_and_count_limits(
+    monkeypatch: pytest.MonkeyPatch, transcript: Transcript
+) -> None:
+    # Bug nyata: LLM tidak pernah diberi tahu batas durasi/jumlah klip secara
+    # eksplisit, cuma menebak "pendek" tanpa angka -- menghasilkan klip di
+    # luar batas berulang kali pada video panjang. Prompt sistem harus
+    # menyebutkan angka [CLIP_MIN_SECONDS, CLIP_MAX_SECONDS, MAX_CLIPS_PER_VIDEO]
+    # yang benar-benar dikonfigurasi lewat env, bukan hardcode.
+    fake_cls, calls = _make_fake_openai([_valid_plan_json()])
+    monkeypatch.setattr("autoclip.pipeline.analyze.AsyncOpenAI", fake_cls)
+
+    await analyze_transcript("job-1", transcript)
+
+    settings = get_settings()
+    system_prompt = calls[0]["messages"][0]["content"]
+    assert str(settings.clip_min_seconds) in system_prompt
+    assert str(settings.clip_max_seconds) in system_prompt
+    assert str(settings.max_clips_per_video) in system_prompt
+
+
+async def test_analyze_transcript_saves_failed_attempts_for_debugging(
+    monkeypatch: pytest.MonkeyPatch, transcript: Transcript
+) -> None:
+    # Kasus nyata: job gagal 3x lalu FAILED tanpa jejak apa pun soal ISI
+    # respons LLM yang gagal divalidasi -- cuma pesan error Pydantic yang
+    # tersimpan di log/db, raw JSON-nya sendiri hilang begitu saja. Setiap
+    # percobaan yang gagal validasi harus ditulis ke disk untuk debugging.
+    invalid_but_parseable = _valid_plan_json(clips=[])  # clips kosong -> gagal validasi
+    fake_cls, calls = _make_fake_openai(
+        [invalid_but_parseable, "bukan json valid sama sekali", invalid_but_parseable]
+    )
+    monkeypatch.setattr("autoclip.pipeline.analyze.AsyncOpenAI", fake_cls)
+
+    with pytest.raises(AnalyzeError):
+        await analyze_transcript("job-1", transcript)
+
+    assert len(calls) == 3
+    settings = get_settings()
+    assert settings.llm_attempt_path("job-1", 1).read_text() == invalid_but_parseable
+    assert settings.llm_attempt_path("job-1", 3).read_text() == invalid_but_parseable
+    # Percobaan 2: JSON-nya sendiri tidak valid sama sekali (bukan cuma gagal
+    # validasi skema) -- tetap harus tersimpan apa adanya untuk diagnosis.
+    assert settings.llm_attempt_path("job-1", 2).read_text() == "bukan json valid sama sekali"
+
+
+async def test_analyze_transcript_does_not_save_attempt_when_api_call_itself_fails(
+    monkeypatch: pytest.MonkeyPatch, transcript: Transcript
+) -> None:
+    # Kalau _call_llm sendiri yang raise (mis. rate limit, konten kosong),
+    # tidak ada raw_json sama sekali untuk disimpan -- pastikan tidak ada
+    # file kosong/salah yang tertulis untuk percobaan itu.
+    fake_cls, calls = _make_fake_openai([RuntimeError("rate limited"), _valid_plan_json()])
+    monkeypatch.setattr("autoclip.pipeline.analyze.AsyncOpenAI", fake_cls)
+
+    await analyze_transcript("job-1", transcript)
+
+    assert len(calls) == 2
+    assert not get_settings().llm_attempt_path("job-1", 1).exists()
+
+
 async def test_analyze_transcript_uses_settings_for_client(
     monkeypatch: pytest.MonkeyPatch, transcript: Transcript
 ) -> None:
