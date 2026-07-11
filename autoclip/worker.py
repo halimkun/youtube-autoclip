@@ -27,7 +27,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from autoclip.db import JobStore, get_job_store
-from autoclip.models import Job, JobStatus
+from autoclip.models import Job, JobStatus, OutputFormat
 from autoclip.pipeline.analyze import AnalyzeError, analyze_transcript
 from autoclip.pipeline.download import DownloadError, download_video, extract_audio
 from autoclip.pipeline.render import RenderError, render_all_clips
@@ -64,7 +64,9 @@ async def _stage_analyze(job_id: str, job: Job, ctx: dict[str, Any]) -> None:
 
 
 async def _stage_render(job_id: str, job: Job, ctx: dict[str, Any]) -> None:
-    await render_all_clips(job_id, ctx["clip_plan"], ctx["transcript"])
+    await render_all_clips(
+        job_id, ctx["clip_plan"], ctx["transcript"], output_format=job.output_format
+    )
 
 
 _STAGES: list[tuple[JobStatus, _StageFn, type[Exception]]] = [
@@ -131,14 +133,15 @@ if __name__ == "__main__":
     import uuid
 
     async def _main() -> None:
-        if len(sys.argv) != 2:
-            print("Pemakaian: python -m autoclip.worker <url>")
+        if len(sys.argv) not in (2, 3):
+            print("Pemakaian: python -m autoclip.worker <url> [vertical|original]")
             raise SystemExit(1)
         url = sys.argv[1]
+        output_format = OutputFormat(sys.argv[2]) if len(sys.argv) == 3 else OutputFormat.VERTICAL
         job_id = uuid.uuid4().hex[:10]
 
         store = get_job_store()
-        job = store.create_job(job_id, url, chat_id=0, user_id=0)
+        job = store.create_job(job_id, url, chat_id=0, user_id=0, output_format=output_format)
         print(f"job_id={job_id} dibuat, status={job.status.value}", flush=True)
 
         result = await process_job(job_id)

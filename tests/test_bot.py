@@ -16,11 +16,12 @@ from autoclip.bot import (
     _watch_job,
     cmd_cancel,
     cmd_status,
+    handle_format_choice,
     handle_youtube_link,
 )
 from autoclip.config import get_settings
 from autoclip.db import JobStore, get_job_store
-from autoclip.models import Clip, ClipPlan, JobStatus
+from autoclip.models import Clip, ClipPlan, JobStatus, OutputFormat
 
 
 class _FakeUser:
@@ -68,9 +69,45 @@ class _FakeBot:
         self.video_calls.append(kwargs)
 
 
+class _FakeCallbackMessage:
+    def __init__(self, message_id: int = 999, chat_id: int = 555) -> None:
+        self.message_id = message_id
+        self.chat = _FakeChat(chat_id)
+        self.edit_texts: list[str] = []
+        self.edit_kwargs: list[dict[str, Any]] = []
+
+    async def edit_text(self, text: str, **kwargs: Any) -> None:
+        self.edit_texts.append(text)
+        self.edit_kwargs.append(kwargs)
+
+
+class _FakeCallbackQuery:
+    def __init__(
+        self,
+        data: str,
+        user_id: int | None,
+        message: _FakeCallbackMessage | None = None,
+    ) -> None:
+        self.data = data
+        self.from_user = None if user_id is None else _FakeUser(user_id)
+        self.message = message if message is not None else _FakeCallbackMessage()
+        self.bot = None
+        self.answers: list[tuple[str | None, dict[str, Any]]] = []
+
+    async def answer(self, text: str | None = None, **kwargs: Any) -> None:
+        self.answers.append((text, kwargs))
+
+
 @pytest.fixture
 def store() -> JobStore:
     return get_job_store()
+
+
+@pytest.fixture(autouse=True)
+def _clear_pending_format_choices():
+    bot_module._pending_format_choices.clear()
+    yield
+    bot_module._pending_format_choices.clear()
 
 
 def test_is_user_allowed_matches_env_whitelist() -> None:
@@ -121,30 +158,95 @@ async def test_handle_youtube_link_rejects_disallowed_user(store: JobStore) -> N
     assert store.next_queued_job() is None
 
 
-async def test_handle_youtube_link_creates_job_and_replies(
+async def test_handle_youtube_link_asks_for_format_confirmation_without_creating_job(
+    store: JobStore,
+) -> None:
+    message = _FakeMessage("tonton https://youtu.be/abc123 dong", user_id=111)
+
+    await handle_youtube_link(message)
+
+    # Job belum boleh ada di DB sama sekali sampai user pilih format lewat tombol.
+    assert store.next_queued_job() is None
+    assert "pilih format" in message.answers[0].lower()
+    assert message.answer_kwargs[0]["parse_mode"] == "HTML"
+
+    keyboard = message.answer_kwargs[0]["reply_markup"].inline_keyboard
+    assert len(keyboard[0]) == 2
+    callback_datas = [button.callback_data for button in keyboard[0]]
+    job_id = next(iter(bot_module._pending_format_choices))
+    assert callback_datas == [f"fmt:vertical:{job_id}", f"fmt:original:{job_id}"]
+    assert bot_module._pending_format_choices[job_id] == ("https://youtu.be/abc123", 555, 111)
+
+
+async def test_handle_youtube_link_ignores_message_without_url(store: JobStore) -> None:
+    message = _FakeMessage("halo, apa kabar?", user_id=111)
+
+    await handle_youtube_link(message)
+
+    assert message.answers == []
+    assert store.next_queued_job() is None
+
+
+async def test_handle_format_choice_creates_job_with_chosen_format_and_replies(
     monkeypatch: pytest.MonkeyPatch, store: JobStore
 ) -> None:
     async def _noop_watch(bot: Any, chat_id: int, message_id: int, job_id: str) -> None:
         return None
 
     monkeypatch.setattr("autoclip.bot._watch_job", _noop_watch)
+    bot_module._pending_format_choices["job-1"] = ("https://youtu.be/abc123", 555, 111)
 
-    message = _FakeMessage("tonton https://youtu.be/abc123 dong", user_id=111)
+    callback = _FakeCallbackQuery("fmt:original:job-1", user_id=111)
 
-    await handle_youtube_link(message)
+    await handle_format_choice(callback)
     await asyncio.sleep(0)  # flush task yang dibuat via asyncio.create_task
 
-    job = store.next_queued_job()
-    assert job is not None
+    job = store.get_job("job-1")
     assert job.url == "https://youtu.be/abc123"
     assert job.chat_id == 555
     assert job.user_id == 111
-    assert job.job_id in message.answers[0]
-    assert "diterima" in message.answers[0]
-    assert message.answer_kwargs[0]["parse_mode"] == "HTML"
+    assert job.output_format is OutputFormat.ORIGINAL
+    assert "job-1" not in bot_module._pending_format_choices
+
+    assert "diterima" in callback.message.edit_texts[0]
+    assert callback.answers == [(None, {})]
 
 
-async def test_handle_youtube_link_keeps_strong_reference_to_watch_task(
+async def test_handle_format_choice_rejects_disallowed_user(store: JobStore) -> None:
+    bot_module._pending_format_choices["job-1"] = ("https://youtu.be/abc123", 555, 111)
+    callback = _FakeCallbackQuery("fmt:vertical:job-1", user_id=999)
+
+    await handle_format_choice(callback)
+
+    assert callback.answers[0][1]["show_alert"] is True
+    assert "job-1" in bot_module._pending_format_choices  # tetap pending, bukan job orang ini
+    with pytest.raises(Exception):
+        store.get_job("job-1")
+
+
+async def test_handle_format_choice_rejects_mismatched_user(store: JobStore) -> None:
+    # job-1 punya user_id 111, tapi yang menekan tombol user_id 222 (whitelisted
+    # tapi bukan pemilik job ini) -- harus ditolak, bukan malah "mencuri" job orang.
+    bot_module._pending_format_choices["job-1"] = ("https://youtu.be/abc123", 555, 111)
+    callback = _FakeCallbackQuery("fmt:vertical:job-1", user_id=222)
+
+    await handle_format_choice(callback)
+
+    assert "bukan job kamu" in callback.answers[0][0].lower()
+    assert bot_module._pending_format_choices["job-1"] == ("https://youtu.be/abc123", 555, 111)
+
+
+async def test_handle_format_choice_rejects_unknown_or_already_confirmed_job(
+    store: JobStore,
+) -> None:
+    callback = _FakeCallbackQuery("fmt:vertical:job-does-not-exist", user_id=111)
+
+    await handle_format_choice(callback)
+
+    assert callback.answers[0][1]["show_alert"] is True
+
+
+async def test_handle_format_choice_keeps_strong_reference_to_watch_task(
     monkeypatch: pytest.MonkeyPatch, store: JobStore
 ) -> None:
     # asyncio.create_task() cuma menyimpan weak reference — tanpa disimpan di
@@ -158,10 +260,10 @@ async def test_handle_youtube_link_keeps_strong_reference_to_watch_task(
         await release.wait()
 
     monkeypatch.setattr("autoclip.bot._watch_job", _blocking_watch)
+    bot_module._pending_format_choices["job-1"] = ("https://youtu.be/abc123", 555, 111)
+    callback = _FakeCallbackQuery("fmt:vertical:job-1", user_id=111)
 
-    message = _FakeMessage("tonton https://youtu.be/abc123 dong", user_id=111)
-
-    await handle_youtube_link(message)
+    await handle_format_choice(callback)
     await started.wait()
 
     assert len(bot_module._background_tasks) == 1
@@ -171,15 +273,6 @@ async def test_handle_youtube_link_keeps_strong_reference_to_watch_task(
     await task  # tunggu task selesai betulan, baru done_callback membersihkannya
 
     assert len(bot_module._background_tasks) == 0
-
-
-async def test_handle_youtube_link_ignores_message_without_url(store: JobStore) -> None:
-    message = _FakeMessage("halo, apa kabar?", user_id=111)
-
-    await handle_youtube_link(message)
-
-    assert message.answers == []
-    assert store.next_queued_job() is None
 
 
 async def test_cmd_status_reports_not_found(store: JobStore) -> None:
@@ -238,6 +331,22 @@ async def test_cmd_cancel_reports_not_found(store: JobStore) -> None:
     await cmd_cancel(message)
 
     assert "tidak ditemukan" in message.answers[0]
+
+
+async def test_cmd_cancel_removes_pending_format_choice_without_touching_store(
+    store: JobStore,
+) -> None:
+    # Job yang masih menunggu konfirmasi format belum punya row DB sama
+    # sekali -- /cancel harus bisa membatalkannya langsung dari pending dict.
+    bot_module._pending_format_choices["job-1"] = ("https://youtu.be/abc", 555, 111)
+    message = _FakeMessage("/cancel job-1", user_id=111)
+
+    await cmd_cancel(message)
+
+    assert "job-1" not in bot_module._pending_format_choices
+    assert "dibatalkan" in message.answers[0]
+    with pytest.raises(Exception):
+        store.get_job("job-1")
 
 
 def _clip(**overrides: Any) -> Clip:

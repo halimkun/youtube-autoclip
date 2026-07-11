@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from autoclip.config import get_settings
-from autoclip.models import Clip, ClipPlan
+from autoclip.models import Clip, ClipPlan, OutputFormat
 from autoclip.pipeline.facecrop import CropWindow, FaceBox
 from autoclip.pipeline.render import (
     RenderError,
@@ -213,6 +213,50 @@ async def test_render_clip_stacks_split_screen_instead_of_cutting_both_faces(
     stream = json.loads(probe.stdout)["streams"][0]
     assert stream["width"] == 1080
     assert stream["height"] == 1920
+
+
+async def test_render_clip_keeps_original_resolution_without_crop(
+    sample_video: Path, transcript: Transcript
+) -> None:
+    # output_format=ORIGINAL: tidak ada crop/scale sama sekali -- resolusi
+    # tetap 640x360 (asli sample_video), bukan dipaksa jadi 1080x1920. Detector
+    # sengaja diberi yang bakal meledak kalau dipanggil -- ORIGINAL tidak
+    # boleh menyentuh deteksi wajah sama sekali.
+    class _BoomDetector:
+        def detect(self, frame):
+            raise AssertionError("format ORIGINAL tidak boleh memanggil deteksi wajah")
+
+    output_path = await render_clip(
+        "job-1",
+        0,
+        _clip(),
+        transcript,
+        video_path=sample_video,
+        detector=_BoomDetector(),
+        output_format=OutputFormat.ORIGINAL,
+    )
+
+    assert output_path.exists()
+    probe = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "json",
+            str(output_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    stream = json.loads(probe.stdout)["streams"][0]
+    assert stream["width"] == 640
+    assert stream["height"] == 360
 
 
 def test_slugify_normalizes_and_truncates() -> None:

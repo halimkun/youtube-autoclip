@@ -15,10 +15,13 @@ kadang tidak menemukan frame sama sekali dan FFmpeg diam-diam menulis
 file MP4 kosong (exit code 0, tapi nb_streams=0) — bukan error yang
 kelihatan, hanya klip corrupt/tidak bisa dibuka. Decode dari awal file
 lebih lambat tapi selalu benar; (2) crop 9:16 berpusat wajah (dari
-`facecrop.py`) + scale ke 1080x1920, (3) burn subtitle `.ass` (dari
-`subtitles.py`). Output H.264 CRF 21 preset veryfast, AAC 128k, nama
-file `<slug-judul>-<n>.mp4`. Melempar `RenderError` bila FFmpeg (atau
-deteksi wajah) gagal di tahap mana pun.
+`facecrop.py`) + scale ke 1080x1920 -- KECUALI `output_format=ORIGINAL`
+(dipilih user lewat tombol Telegram, lihat bot.py), yang melewati crop
+wajah sama sekali dan mempertahankan resolusi/rasio aspek video sumber
+apa adanya; (3) burn subtitle `.ass` (dari `subtitles.py`). Output H.264
+CRF 21 preset veryfast, AAC 128k, nama file `<slug-judul>-<n>.mp4`.
+Melempar `RenderError` bila FFmpeg (atau deteksi wajah/probe dimensi)
+gagal di tahap mana pun.
 """
 
 from __future__ import annotations
@@ -29,12 +32,13 @@ import re
 from pathlib import Path
 
 from autoclip.config import get_settings
-from autoclip.models import Clip, ClipPlan
+from autoclip.models import Clip, ClipPlan, OutputFormat
 from autoclip.pipeline.facecrop import (
     CropWindow,
     FaceDetector,
     SplitCropWindow,
     compute_crop_window,
+    probe_frame_size,
 )
 from autoclip.pipeline.subtitles import write_ass_file
 from autoclip.pipeline.transcribe import Transcript
@@ -60,8 +64,10 @@ async def render_clip(
     transcript: Transcript,
     video_path: Path | None = None,
     detector: FaceDetector | None = None,
+    output_format: OutputFormat = OutputFormat.VERTICAL,
 ) -> Path:
-    """Render satu klip: cut + crop 9:16 + burn subtitle dalam satu pass ffmpeg.
+    """Render satu klip: cut + crop 9:16 (atau rasio asli) + burn subtitle
+    dalam satu pass ffmpeg.
 
     Idempotent: kalau file output sudah ada, tidak di-render ulang.
     """
@@ -80,14 +86,32 @@ async def render_clip(
     start_seconds = clip.start_seconds
     end_seconds = clip.end_seconds
 
-    try:
-        crop_window = await asyncio.to_thread(
-            compute_crop_window, source, start_seconds, end_seconds, detector
+    if output_format is OutputFormat.ORIGINAL:
+        # Format ORIGINAL tidak butuh crop wajah sama sekali -- cuma perlu
+        # tahu resolusi asli supaya subtitle (PlayRes) tetap proporsional.
+        try:
+            frame_width, frame_height = await asyncio.to_thread(probe_frame_size, source)
+        except Exception as exc:
+            raise RenderError(
+                f"Membaca dimensi video gagal untuk klip {clip_index}: {exc}"
+            ) from exc
+        crop_window = None
+        ass_path = write_ass_file(
+            job_id,
+            clip_index,
+            transcript,
+            start_seconds,
+            end_seconds,
+            play_res=(frame_width, frame_height),
         )
-    except Exception as exc:
-        raise RenderError(f"Deteksi wajah gagal untuk klip {clip_index}: {exc}") from exc
-
-    ass_path = write_ass_file(job_id, clip_index, transcript, start_seconds, end_seconds)
+    else:
+        try:
+            crop_window = await asyncio.to_thread(
+                compute_crop_window, source, start_seconds, end_seconds, detector
+            )
+        except Exception as exc:
+            raise RenderError(f"Deteksi wajah gagal untuk klip {clip_index}: {exc}") from exc
+        ass_path = write_ass_file(job_id, clip_index, transcript, start_seconds, end_seconds)
 
     # Tulis ke path sementara lalu rename setelah sukses (atomic), supaya proses
     # yang terputus di tengah jalan (crash/kill/OOM) tidak meninggalkan file klip
@@ -135,10 +159,19 @@ async def render_all_clips(
     transcript: Transcript,
     video_path: Path | None = None,
     detector: FaceDetector | None = None,
+    output_format: OutputFormat = OutputFormat.VERTICAL,
 ) -> list[Path]:
     """Render semua klip di `ClipPlan` secara berurutan (satu worker, serial)."""
     return [
-        await render_clip(job_id, index, clip, transcript, video_path=video_path, detector=detector)
+        await render_clip(
+            job_id,
+            index,
+            clip,
+            transcript,
+            video_path=video_path,
+            detector=detector,
+            output_format=output_format,
+        )
         for index, clip in enumerate(clip_plan.clips)
     ]
 
@@ -154,7 +187,7 @@ def _build_ffmpeg_command(
     source: Path,
     start_seconds: int,
     end_seconds: int,
-    crop_window: CropWindow | SplitCropWindow,
+    crop_window: CropWindow | SplitCropWindow | None,
     ass_path: Path,
     output_path: Path,
 ) -> list[str]:
@@ -180,6 +213,15 @@ def _build_ffmpeg_command(
             "-map",
             "0:a:0",
         ]
+    elif crop_window is None:
+        # Format ORIGINAL: tidak ada crop/scale sama sekali, rasio aspek &
+        # resolusi video sumber dipertahankan apa adanya.
+        filter_chain = (
+            f"trim=start={start_seconds}:end={end_seconds},"
+            "setpts=PTS-STARTPTS,"
+            f"ass={_escape_filter_path(ass_path)}"
+        )
+        video_args = ["-vf", filter_chain]
     else:
         filter_chain = (
             f"trim=start={start_seconds}:end={end_seconds},"

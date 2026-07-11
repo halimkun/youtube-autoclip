@@ -119,6 +119,22 @@ class YuNetFaceDetector:
         return [FaceBox(x=row[0], y=row[1], width=row[2], height=row[3]) for row in faces]
 
 
+def probe_frame_size(video_path: Path) -> tuple[int, int]:
+    """Buka video sebentar cuma untuk baca (width, height) asli -- TANPA
+    sampling/deteksi wajah sama sekali. Dipakai render.py untuk format
+    ORIGINAL (tidak butuh crop wajah), cuma perlu tahu resolusi asli untuk
+    `PlayRes` subtitle di subtitles.py."""
+    capture = cv2.VideoCapture(str(video_path))
+    try:
+        if not capture.isOpened():
+            raise ValueError(f"Tidak bisa membuka video: {video_path}")
+        width = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    finally:
+        capture.release()
+    return width, height
+
+
 def compute_crop_window(
     video_path: Path,
     clip_start_seconds: float,

@@ -2,7 +2,9 @@
 
 Mendefinisikan kontrak data BRIEF.md bagian 4 (skema JSON output LLM)
 dan status job: `Clip`, `ClipPlan`, `Job`, serta enum status
-(QUEUED, DOWNLOADING, TRANSCRIBING, ANALYZING, RENDERING, DONE, FAILED).
+(QUEUED, DOWNLOADING, TRANSCRIBING, ANALYZING, RENDERING, DONE, FAILED)
+dan `OutputFormat` (VERTICAL/ORIGINAL, dipilih user lewat tombol Telegram
+sebelum job dibuat).
 Termasuk validator Pydantic untuk aturan bisnis klip (format timestamp
 HH:MM:SS, end > start, durasi min/maks, virality_score 1-10, jumlah
 klip maksimal, dan larangan overlap > 10 detik antar klip).
@@ -70,6 +72,14 @@ class JobStatus(StrEnum):
     RENDERING = "RENDERING"
     DONE = "DONE"
     FAILED = "FAILED"
+
+
+class OutputFormat(StrEnum):
+    """Format output klip yang dikonfirmasi user lewat tombol Telegram
+    sebelum job dibuat -- lihat bot.py `handle_format_choice`."""
+
+    VERTICAL = "vertical"
+    ORIGINAL = "original"
 
 
 class Clip(BaseModel):
@@ -167,6 +177,7 @@ class Job(BaseModel):
     chat_id: int
     user_id: int
     status: JobStatus = JobStatus.QUEUED
+    output_format: OutputFormat = OutputFormat.VERTICAL
     error_message: str | None = None
     created_at: datetime
     updated_at: datetime

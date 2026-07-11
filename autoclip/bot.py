@@ -1,11 +1,13 @@
 """Handler bot Telegram (aiogram v3) dan entrypoint `python -m autoclip.bot`.
 
 Menerima link YouTube langsung (tanpa command) dari user ber-whitelist
-(`TELEGRAM_ALLOWED_USERS`), membuat job baru di database, dan membalas
-konfirmasi + job_id. Menyediakan perintah `/status <job_id>` dan
-`/cancel <job_id>`. Progress job dipantau lewat task terpisah yang
-polling `db.py` dan mengedit pesan konfirmasi (bukan mengirim pesan
-baru) setiap status berubah; saat DONE, klip dikirim via
+(`TELEGRAM_ALLOWED_USERS`), lalu membalas dengan tombol inline (Vertical
+9:16 / Original) meminta user memilih format output SEBELUM job dibuat
+di database sama sekali (lihat `handle_format_choice`) — pipeline baru
+mulai jalan setelah format dikonfirmasi. Menyediakan perintah
+`/status <job_id>` dan `/cancel <job_id>`. Progress job dipantau lewat
+task terpisah yang polling `db.py` dan mengedit pesan konfirmasi (bukan
+mengirim pesan baru) setiap status berubah; saat DONE, klip dikirim via
 `telegram_sender.py`. Menjalankan bot bersamaan dengan worker (lihat
 worker.py) dalam satu proses async.
 """
@@ -20,11 +22,11 @@ import uuid
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from autoclip.config import get_settings
 from autoclip.db import JobNotFoundError, get_job_store
-from autoclip.models import ClipPlan, JobStatus
+from autoclip.models import ClipPlan, JobStatus, OutputFormat
 from autoclip.pipeline.render import clip_output_path
 from autoclip.telegram_sender import (
     StageEvent,
@@ -42,6 +44,7 @@ _YOUTUBE_URL_RE = re.compile(
 )
 
 _WATCH_POLL_INTERVAL_SECONDS = 3.0
+_FORMAT_CALLBACK_PREFIX = "fmt"
 
 # asyncio.create_task() cuma menyimpan WEAK reference ke task-nya — tanpa
 # strong reference disimpan di tempat lain, task _watch_job bisa di-garbage-
@@ -49,6 +52,14 @@ _WATCH_POLL_INTERVAL_SECONDS = 3.0
 # pun), bikin pesan Telegram berhenti ter-update walau job-nya sendiri
 # terus jalan normal di worker. Simpan reference-nya di sini sampai selesai.
 _background_tasks: set[asyncio.Task[None]] = set()
+
+# job_id -> (url, chat_id, user_id) untuk link yang sudah divalidasi tapi
+# BELUM dikonfirmasi formatnya oleh user (belum ada row di JobStore sama
+# sekali). In-memory saja (bukan tabel DB) sengaja: kalau bot restart
+# sebelum user menekan tombol, entry ini hilang -- dianggap acceptable
+# untuk bot personal dengan jendela konfirmasi pendek, sama seperti
+# tradeoff `_background_tasks` di atas.
+_pending_format_choices: dict[str, tuple[str, int, int]] = {}
 
 
 def _is_user_allowed(user_id: int) -> bool:
@@ -71,8 +82,26 @@ def _generate_job_id() -> str:
     return uuid.uuid4().hex[:10]
 
 
+def _format_choice_keyboard(job_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📱 Vertical (9:16)",
+                    callback_data=f"{_FORMAT_CALLBACK_PREFIX}:{OutputFormat.VERTICAL.value}:{job_id}",
+                ),
+                InlineKeyboardButton(
+                    text="🎬 Original",
+                    callback_data=f"{_FORMAT_CALLBACK_PREFIX}:{OutputFormat.ORIGINAL.value}:{job_id}",
+                ),
+            ]
+        ]
+    )
+
+
 async def handle_youtube_link(message: Message) -> None:
-    """Terima link YouTube langsung (bukan command), buat job baru."""
+    """Terima link YouTube langsung (bukan command), minta konfirmasi format
+    lewat tombol SEBELUM job dibuat di database (lihat `handle_format_choice`)."""
     user = message.from_user
     if user is None or not _is_user_allowed(user.id):
         await message.answer("Kamu tidak diizinkan menggunakan bot ini.")
@@ -83,18 +112,61 @@ async def handle_youtube_link(message: Message) -> None:
         return
 
     job_id = _generate_job_id()
-    store = get_job_store()
-    store.create_job(job_id, url, chat_id=message.chat.id, user_id=user.id)
-    logger.info("job_id=%s dibuat oleh user_id=%s untuk url=%s", job_id, user.id, url)
-
-    # Pesan ini cuma placeholder — _watch_job langsung menimpanya dengan
-    # timeline lengkap begitu poll pertama mendeteksi status job.
-    sent = await message.answer(
-        f"🎬 Job <code>{html.escape(job_id)}</code> diterima, memulai...", parse_mode="HTML"
+    _pending_format_choices[job_id] = (url, message.chat.id, user.id)
+    logger.info(
+        "job_id=%s menunggu konfirmasi format dari user_id=%s untuk url=%s", job_id, user.id, url
     )
-    task = asyncio.create_task(_watch_job(message.bot, message.chat.id, sent.message_id, job_id))
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
+
+    await message.answer(
+        f"🎬 Job <code>{html.escape(job_id)}</code> — pilih format output klip:",
+        parse_mode="HTML",
+        reply_markup=_format_choice_keyboard(job_id),
+    )
+
+
+async def handle_format_choice(callback: CallbackQuery) -> None:
+    """Tombol format ditekan: buat job baru di database dengan format yang
+    dipilih, lalu mulai watch progress-nya. Sebelum titik ini, job BELUM
+    ada di JobStore sama sekali (lihat `_pending_format_choices`)."""
+    user = callback.from_user
+    if user is None or not _is_user_allowed(user.id):
+        await callback.answer("Kamu tidak diizinkan menggunakan bot ini.", show_alert=True)
+        return
+
+    data = callback.data or ""
+    _, _, remainder = data.partition(":")
+    format_value, _, job_id = remainder.partition(":")
+
+    pending = _pending_format_choices.pop(job_id, None)
+    if pending is None:
+        await callback.answer("Job ini sudah dikonfirmasi atau sudah kedaluwarsa.", show_alert=True)
+        return
+
+    url, chat_id, pending_user_id = pending
+    if user.id != pending_user_id:
+        _pending_format_choices[job_id] = pending  # bukan job orang ini, kembalikan
+        await callback.answer("Ini bukan job kamu.", show_alert=True)
+        return
+
+    output_format = OutputFormat(format_value)
+    store = get_job_store()
+    store.create_job(job_id, url, chat_id=chat_id, user_id=user.id, output_format=output_format)
+    logger.info("job_id=%s dibuat oleh user_id=%s, format=%s", job_id, user.id, output_format.value)
+
+    message = callback.message
+    if message is not None:
+        # Pesan ini cuma placeholder — _watch_job langsung menimpanya dengan
+        # timeline lengkap begitu poll pertama mendeteksi status job.
+        await message.edit_text(
+            f"🎬 Job <code>{html.escape(job_id)}</code> diterima, memulai...", parse_mode="HTML"
+        )
+        task = asyncio.create_task(
+            _watch_job(callback.bot, message.chat.id, message.message_id, job_id)
+        )
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
+
+    await callback.answer()
 
 
 async def cmd_status(message: Message) -> None:
@@ -131,7 +203,8 @@ async def cmd_status(message: Message) -> None:
 
 
 async def cmd_cancel(message: Message) -> None:
-    """`/cancel <job_id>` — batalkan job yang masih QUEUED (belum diproses worker)."""
+    """`/cancel <job_id>` — batalkan job yang masih menunggu konfirmasi format
+    (belum ada row DB) atau masih QUEUED (belum diproses worker)."""
     user = message.from_user
     if user is None or not _is_user_allowed(user.id):
         await message.answer("Kamu tidak diizinkan menggunakan bot ini.")
@@ -140,6 +213,13 @@ async def cmd_cancel(message: Message) -> None:
     job_id = _parse_command_arg(message.text or "")
     if job_id is None:
         await message.answer("Pakai format: /cancel &lt;job_id&gt;", parse_mode="HTML")
+        return
+
+    if job_id in _pending_format_choices:
+        del _pending_format_choices[job_id]
+        await message.answer(
+            f"Job <code>{html.escape(job_id)}</code> dibatalkan.", parse_mode="HTML"
+        )
         return
 
     store = get_job_store()
@@ -198,6 +278,9 @@ def create_dispatcher() -> Dispatcher:
     dp.message.register(cmd_status, Command("status"))
     dp.message.register(cmd_cancel, Command("cancel"))
     dp.message.register(handle_youtube_link, F.text.regexp(_YOUTUBE_URL_RE))
+    dp.callback_query.register(
+        handle_format_choice, F.data.startswith(f"{_FORMAT_CALLBACK_PREFIX}:")
+    )
     return dp
 
 

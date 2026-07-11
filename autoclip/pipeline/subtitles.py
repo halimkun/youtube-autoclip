@@ -14,10 +14,14 @@ from pathlib import Path
 from autoclip.config import get_settings
 from autoclip.pipeline.transcribe import Transcript, TranscriptWord
 
-_HEADER = """[Script Info]
+_DEFAULT_PLAY_RES = (1080, 1920)
+
+
+def _build_header(play_res_x: int, play_res_y: int) -> str:
+    return f"""[Script Info]
 ScriptType: v4.00+
-PlayResX: 1080
-PlayResY: 1920
+PlayResX: {play_res_x}
+PlayResY: {play_res_y}
 WrapStyle: 0
 ScaledBorderAndShadow: yes
 
@@ -38,8 +42,15 @@ def generate_ass(
     clip_start_seconds: float,
     clip_end_seconds: float,
     words_per_line: int = 3,
+    play_res: tuple[int, int] = _DEFAULT_PLAY_RES,
 ) -> str:
-    """Bangun isi file `.ass` untuk satu klip dari word-level transcript."""
+    """Bangun isi file `.ass` untuk satu klip dari word-level transcript.
+
+    `play_res` (PlayResX, PlayResY) default 1080x1920 (output vertikal 9:16).
+    Untuk format ORIGINAL (render.py), dipanggil dengan resolusi asli video
+    sumber supaya posisi/ukuran subtitle tetap proporsional -- bukan
+    dipaksa skala rasio 9:16 di video yang rasio aspeknya beda jauh.
+    """
     if not 2 <= words_per_line <= 4:
         raise ValueError("words_per_line harus 2-4 sesuai BRIEF.md bagian 5.3")
 
@@ -48,7 +59,7 @@ def generate_ass(
         _dialogue_line(group, clip_start_seconds, clip_end_seconds)
         for group in _chunked(clip_words, words_per_line)
     )
-    return _HEADER + dialogue_lines
+    return _build_header(*play_res) + dialogue_lines
 
 
 def write_ass_file(
@@ -58,12 +69,15 @@ def write_ass_file(
     clip_start_seconds: float,
     clip_end_seconds: float,
     words_per_line: int = 3,
+    play_res: tuple[int, int] = _DEFAULT_PLAY_RES,
 ) -> Path:
     """Generate lalu simpan file `.ass` untuk satu klip ke `data/media/<job_id>/clips/`."""
     settings = get_settings()
     settings.ensure_job_dir(job_id)
     output_path = settings.clips_dir(job_id) / f"clip-{clip_index:02d}.ass"
-    content = generate_ass(transcript, clip_start_seconds, clip_end_seconds, words_per_line)
+    content = generate_ass(
+        transcript, clip_start_seconds, clip_end_seconds, words_per_line, play_res
+    )
     output_path.write_text(content, encoding="utf-8")
     return output_path
 

@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from autoclip.db import JobStore, get_job_store
-from autoclip.models import Job, JobStatus
+from autoclip.models import Job, JobStatus, OutputFormat
 from autoclip.pipeline.analyze import AnalyzeError
 from autoclip.pipeline.download import DownloadError
 from autoclip.pipeline.render import RenderError
@@ -42,7 +42,9 @@ def _install_success_mocks(monkeypatch: pytest.MonkeyPatch, call_order: list[str
         assert transcript == "FAKE_TRANSCRIPT"
         return "FAKE_PLAN"
 
-    async def _render(job_id: str, clip_plan: str, transcript: str) -> list[Path]:
+    async def _render(
+        job_id: str, clip_plan: str, transcript: str, output_format: OutputFormat
+    ) -> list[Path]:
         call_order.append("render")
         assert clip_plan == "FAKE_PLAN"
         assert transcript == "FAKE_TRANSCRIPT"
@@ -66,6 +68,34 @@ async def test_process_job_runs_full_pipeline_in_order(
 
     assert job.status is JobStatus.DONE
     assert call_order == ["download", "extract_audio", "transcribe", "analyze", "render"]
+
+
+async def test_process_job_passes_job_output_format_to_render_stage(
+    monkeypatch: pytest.MonkeyPatch, store: JobStore
+) -> None:
+    # output_format dipilih user lewat tombol Telegram sebelum job dibuat
+    # (lihat bot.py) -- worker harus meneruskannya apa adanya ke render stage,
+    # bukan selalu VERTICAL.
+    store.create_job(
+        "job-1", "https://youtu.be/xyz", chat_id=1, user_id=2, output_format=OutputFormat.ORIGINAL
+    )
+    call_order: list[str] = []
+    _install_success_mocks(monkeypatch, call_order)
+
+    received: list[OutputFormat] = []
+
+    async def _render(
+        job_id: str, clip_plan: str, transcript: str, output_format: OutputFormat
+    ) -> list[Path]:
+        received.append(output_format)
+        return [Path("/tmp/clip-0.mp4")]
+
+    monkeypatch.setattr("autoclip.worker.render_all_clips", _render)
+
+    job = await process_job("job-1")
+
+    assert job.status is JobStatus.DONE
+    assert received == [OutputFormat.ORIGINAL]
 
 
 async def test_process_job_marks_failed_on_download_error(
@@ -128,7 +158,9 @@ async def test_process_job_marks_failed_on_render_error(
     call_order: list[str] = []
     _install_success_mocks(monkeypatch, call_order)
 
-    async def _boom(job_id: str, clip_plan: str, transcript: str) -> list[Path]:
+    async def _boom(
+        job_id: str, clip_plan: str, transcript: str, output_format: OutputFormat
+    ) -> list[Path]:
         raise RenderError("ffmpeg gagal")
 
     monkeypatch.setattr("autoclip.worker.render_all_clips", _boom)

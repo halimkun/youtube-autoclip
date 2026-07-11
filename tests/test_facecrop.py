@@ -16,6 +16,7 @@ from autoclip.pipeline.facecrop import (
     _pick_split_clusters,
     _sample_timestamps,
     compute_crop_window,
+    probe_frame_size,
 )
 
 
@@ -133,6 +134,16 @@ def test_compute_crop_window_clamps_when_face_near_right_edge(sample_video: Path
     )
 
     assert window.x == 640 - window.width
+
+
+def test_probe_frame_size_returns_actual_dimensions(sample_video: Path) -> None:
+    # sample_video di conftest digenerate 640x360 -- lihat fixture.
+    assert probe_frame_size(sample_video) == (640, 360)
+
+
+def test_probe_frame_size_raises_when_video_cannot_be_opened() -> None:
+    with pytest.raises(ValueError, match="Tidak bisa membuka video"):
+        probe_frame_size(Path("/does/not/exist.mp4"))
 
 
 def test_compute_crop_window_raises_when_video_cannot_be_opened() -> None:

@@ -45,6 +45,19 @@ def test_generate_ass_header_has_bottom_center_bold_style(transcript: Transcript
     assert fields[18] == "2"  # Alignment: bottom-center
 
 
+def test_generate_ass_uses_custom_play_res(transcript: Transcript) -> None:
+    # Format ORIGINAL (render.py) memberi resolusi asli video sumber, bukan
+    # 1080x1920 default -- supaya subtitle tetap proporsional di video
+    # yang rasio aspeknya beda dari 9:16.
+    content = generate_ass(
+        transcript, clip_start_seconds=100.0, clip_end_seconds=106.0, play_res=(1920, 1080)
+    )
+
+    assert "PlayResX: 1920" in content
+    assert "PlayResY: 1080" in content
+    assert "PlayResX: 1080" not in content
+
+
 def test_generate_ass_excludes_words_outside_clip_range(transcript: Transcript) -> None:
     content = generate_ass(transcript, clip_start_seconds=100.0, clip_end_seconds=106.0)
 

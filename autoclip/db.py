@@ -17,7 +17,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from autoclip.config import get_settings
-from autoclip.models import Job, JobStatus
+from autoclip.models import Job, JobStatus, OutputFormat
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -26,11 +26,21 @@ CREATE TABLE IF NOT EXISTS jobs (
     chat_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL,
     status TEXT NOT NULL,
+    output_format TEXT NOT NULL DEFAULT 'vertical',
     error_message TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
 """
+
+# Migrasi in-place untuk DB yang sudah ada dari sebelum kolom ini ditambahkan
+# -- CREATE TABLE IF NOT EXISTS di atas no-op kalau tabel sudah ada, jadi
+# kolom baru tidak pernah muncul tanpa ALTER TABLE eksplisit. Tidak ada
+# framework migrasi di stack ini (per CLAUDE.md), jadi ALTER TABLE defensif
+# dibungkus try/except ini konsisten dengan gaya proyek yang sudah ada.
+_MIGRATION_ADD_OUTPUT_FORMAT = (
+    "ALTER TABLE jobs ADD COLUMN output_format TEXT NOT NULL DEFAULT 'vertical'"
+)
 
 # State machine pipeline (BRIEF.md bagian 2). FAILED bisa retry langsung ke
 # tahap yang gagal (artefak sebelumnya tidak dihapus, lihat CLAUDE.md aturan #3).
@@ -80,6 +90,10 @@ class JobStore:
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.execute(_SCHEMA)
+            try:
+                conn.execute(_MIGRATION_ADD_OUTPUT_FORMAT)
+            except sqlite3.OperationalError:
+                pass  # kolom sudah ada (DB dibuat setelah kolom ini ada di _SCHEMA)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -91,8 +105,21 @@ class JobStore:
         finally:
             conn.close()
 
-    def create_job(self, job_id: str, url: str, chat_id: int, user_id: int) -> Job:
-        """Buat job baru dengan status awal QUEUED."""
+    def create_job(
+        self,
+        job_id: str,
+        url: str,
+        chat_id: int,
+        user_id: int,
+        output_format: OutputFormat = OutputFormat.VERTICAL,
+    ) -> Job:
+        """Buat job baru dengan status awal QUEUED.
+
+        `output_format` sudah harus final di titik ini -- di alur bot.py,
+        job baru dibuat SETELAH user menekan tombol konfirmasi format
+        (lihat `handle_format_choice`), jadi tidak ada status "menunggu
+        pilihan format" tersendiri di state machine job.
+        """
         now = datetime.now(UTC)
         job = Job(
             job_id=job_id,
@@ -100,6 +127,7 @@ class JobStore:
             chat_id=chat_id,
             user_id=user_id,
             status=JobStatus.QUEUED,
+            output_format=output_format,
             created_at=now,
             updated_at=now,
         )
@@ -107,8 +135,9 @@ class JobStore:
             conn.execute(
                 """
                 INSERT INTO jobs
-                    (job_id, url, chat_id, user_id, status, error_message, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (job_id, url, chat_id, user_id, status, output_format,
+                     error_message, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job.job_id,
@@ -116,6 +145,7 @@ class JobStore:
                     job.chat_id,
                     job.user_id,
                     job.status.value,
+                    job.output_format.value,
                     job.error_message,
                     job.created_at.isoformat(),
                     job.updated_at.isoformat(),
@@ -168,6 +198,7 @@ def _row_to_job(row: sqlite3.Row) -> Job:
         chat_id=row["chat_id"],
         user_id=row["user_id"],
         status=JobStatus(row["status"]),
+        output_format=OutputFormat(row["output_format"]),
         error_message=row["error_message"],
         created_at=datetime.fromisoformat(row["created_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
