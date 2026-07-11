@@ -9,8 +9,11 @@ import pytest
 from autoclip.pipeline.facecrop import (
     CropWindow,
     FaceBox,
+    SplitCropWindow,
     YuNetFaceDetector,
+    _build_half_crop,
     _dominant_face_center_x,
+    _pick_split_clusters,
     _sample_timestamps,
     compute_crop_window,
 )
@@ -183,13 +186,63 @@ def test_compute_crop_window_picks_dominant_cluster_in_split_screen(sample_video
     assert window.x == max(0, round(100.0 - window.width / 2))
 
 
-def test_compute_crop_window_breaks_tie_by_leftmost_face_in_split_screen(
+def test_compute_crop_window_splits_when_both_faces_tied_every_frame(
     sample_video: Path,
 ) -> None:
-    # Kedua wajah terdeteksi sama banyak (seri) -- pilih klaster paling kiri
-    # secara deterministik, bukan rata-rata keduanya yang jatuh di garis pemisah.
+    # Kedua wajah terdeteksi SAMA BANYAK di SETIAP frame -- ini split-screen
+    # genuine (dua speaker sama-sama tampil terus), bukan cuma "kebetulan
+    # seri" di sampel. Tidak ada speaker dominan untuk dipilih, jadi hasilnya
+    # harus SplitCropWindow (dua strip ditumpuk), bukan crop tunggal yang
+    # memaksa pilih salah satu dan menghilangkan yang lain.
     detector = _FixedTwoFaceDetector(left_x=100.0, right_x=500.0)
 
     window = compute_crop_window(sample_video, 0.5, 2.5, detector=detector)
 
-    assert window.x == max(0, round(100.0 - window.width / 2))
+    assert isinstance(window, SplitCropWindow)
+    # Wajah kiri (x=100) jadi window atas, wajah kanan (x=500) jadi bawah --
+    # urutan kiri-ke-kanan yang stabil, bukan urutan deteksi.
+    assert window.top.x < window.bottom.x
+
+
+def _face(center_x: float, center_y: float = 50.0, size: float = 100.0) -> FaceBox:
+    return FaceBox(x=center_x - size / 2, y=center_y - size / 2, width=size, height=size)
+
+
+def test_pick_split_clusters_returns_none_for_single_cluster() -> None:
+    clusters = [[_face(100.0), _face(105.0)]]
+    assert _pick_split_clusters(clusters) is None
+
+
+def test_pick_split_clusters_returns_none_when_one_side_dominant() -> None:
+    # Selisih deteksi 3 (5 vs 2) -- ada pemenang yang jelas, bukan seri.
+    clusters = [[_face(100.0)] * 5, [_face(500.0)] * 2]
+    assert _pick_split_clusters(clusters) is None
+
+
+def test_pick_split_clusters_returns_none_when_minor_cluster_is_single_detection() -> None:
+    # Klaster kedua cuma 1 deteksi -- terlalu rawan noise untuk dianggap speaker asli.
+    clusters = [[_face(100.0)] * 3, [_face(500.0)]]
+    assert _pick_split_clusters(clusters) is None
+
+
+def test_pick_split_clusters_detects_genuine_tie() -> None:
+    clusters = [[_face(500.0)] * 4, [_face(100.0)] * 3]
+
+    result = _pick_split_clusters(clusters)
+
+    assert result is not None
+    left, right = result
+    assert all(f.center_x == 100.0 for f in left)
+    assert all(f.center_x == 500.0 for f in right)
+
+
+def test_build_half_crop_centers_on_cluster_average(sample_video: Path) -> None:
+    cluster = [_face(100.0, center_y=80.0), _face(120.0, center_y=100.0)]
+
+    window = _build_half_crop(cluster, frame_width=640, frame_height=360)
+
+    assert window.width == round(window.height * 9 / 8)
+    expected_x = max(0, round(110.0 - window.width / 2))
+    expected_y = max(0, round(90.0 - window.height / 2))
+    assert window.x == expected_x
+    assert window.y == expected_y

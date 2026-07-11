@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -25,6 +27,21 @@ class _FixedFaceDetector:
 
     def detect(self, frame) -> list[FaceBox]:
         return [FaceBox(x=self._center_x - 50, y=0, width=100, height=100)]
+
+
+class _TiedSplitScreenDetector:
+    """Dua wajah terdeteksi sama banyak di SETIAP frame -- memicu SplitCropWindow
+    (lihat facecrop._pick_split_clusters), bukan crop tunggal."""
+
+    def __init__(self, left_x: float = 160.0, right_x: float = 480.0) -> None:
+        self._left_x = left_x
+        self._right_x = right_x
+
+    def detect(self, frame) -> list[FaceBox]:
+        return [
+            FaceBox(x=self._left_x - 50, y=0, width=100, height=100),
+            FaceBox(x=self._right_x - 50, y=0, width=100, height=100),
+        ]
 
 
 @pytest.fixture(autouse=True)
@@ -156,6 +173,46 @@ async def test_render_all_clips_renders_each_clip_in_order(
 
     assert [p.name for p in paths] == ["klip-pertama-0.mp4", "klip-kedua-1.mp4"]
     assert all(p.exists() for p in paths)
+
+
+async def test_render_clip_stacks_split_screen_instead_of_cutting_both_faces(
+    sample_video: Path, transcript: Transcript
+) -> None:
+    # Bug nyata yang dilaporkan: video split-screen 2 pembicara, crop tunggal
+    # jatuh di garis pemisah dan memotong keduanya jadi setengah-setengah.
+    # Dengan detektor yang melihat dua wajah sama banyak di tiap frame,
+    # render harus pakai layout bertumpuk (SplitCropWindow) -- verifikasi lewat
+    # ffprobe bahwa hasilnya tetap video vertikal 1080x1920 yang valid.
+    output_path = await render_clip(
+        "job-1",
+        0,
+        _clip(),
+        transcript,
+        video_path=sample_video,
+        detector=_TiedSplitScreenDetector(),
+    )
+
+    assert output_path.exists()
+    probe = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "json",
+            str(output_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    stream = json.loads(probe.stdout)["streams"][0]
+    assert stream["width"] == 1080
+    assert stream["height"] == 1920
 
 
 def test_slugify_normalizes_and_truncates() -> None:

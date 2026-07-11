@@ -30,7 +30,12 @@ from pathlib import Path
 
 from autoclip.config import get_settings
 from autoclip.models import Clip, ClipPlan
-from autoclip.pipeline.facecrop import CropWindow, FaceDetector, compute_crop_window
+from autoclip.pipeline.facecrop import (
+    CropWindow,
+    FaceDetector,
+    SplitCropWindow,
+    compute_crop_window,
+)
 from autoclip.pipeline.subtitles import write_ass_file
 from autoclip.pipeline.transcribe import Transcript
 
@@ -149,7 +154,7 @@ def _build_ffmpeg_command(
     source: Path,
     start_seconds: int,
     end_seconds: int,
-    crop_window: CropWindow,
+    crop_window: CropWindow | SplitCropWindow,
     ass_path: Path,
     output_path: Path,
 ) -> list[str]:
@@ -166,21 +171,32 @@ def _build_ffmpeg_command(
     # absolut asli video (bukan relatif ke awal klip), sehingga event
     # Dialogue di file .ass (yang relatif ke awal klip) tidak pernah cocok
     # dan subtitle tidak pernah muncul sama sekali.
-    filter_chain = (
-        f"trim=start={start_seconds}:end={end_seconds},"
-        "setpts=PTS-STARTPTS,"
-        f"crop={crop_window.width}:{crop_window.height}:{crop_window.x}:{crop_window.y},"
-        "scale=1080:1920,"
-        f"ass={_escape_filter_path(ass_path)}"
-    )
+    if isinstance(crop_window, SplitCropWindow):
+        video_args = [
+            "-filter_complex",
+            _build_split_filter_complex(start_seconds, end_seconds, crop_window, ass_path),
+            "-map",
+            "[outv]",
+            "-map",
+            "0:a:0",
+        ]
+    else:
+        filter_chain = (
+            f"trim=start={start_seconds}:end={end_seconds},"
+            "setpts=PTS-STARTPTS,"
+            f"crop={crop_window.width}:{crop_window.height}:{crop_window.x}:{crop_window.y},"
+            "scale=1080:1920,"
+            f"ass={_escape_filter_path(ass_path)}"
+        )
+        video_args = ["-vf", filter_chain]
+
     audio_filter = f"atrim=start={start_seconds}:end={end_seconds},asetpts=PTS-STARTPTS"
     return [
         "ffmpeg",
         "-y",
         "-i",
         str(source),
-        "-vf",
-        filter_chain,
+        *video_args,
         "-af",
         audio_filter,
         "-c:v",
@@ -195,6 +211,26 @@ def _build_ffmpeg_command(
         "128k",
         str(output_path),
     ]
+
+
+def _build_split_filter_complex(
+    start_seconds: int,
+    end_seconds: int,
+    crop_window: SplitCropWindow,
+    ass_path: Path,
+) -> str:
+    """Filtergraph split-screen: crop dua strip 9:8 (atas=top, bawah=bottom)
+    dari sumber yang sama, lalu tumpuk (`vstack`) jadi 1080x1920 sebelum
+    subtitle di-burn di atas hasil gabungan (bukan per-strip)."""
+    top, bottom = crop_window.top, crop_window.bottom
+    ass_arg = _escape_filter_path(ass_path)
+    return (
+        f"[0:v]trim=start={start_seconds}:end={end_seconds},"
+        "setpts=PTS-STARTPTS,split=2[vtop][vbot];"
+        f"[vtop]crop={top.width}:{top.height}:{top.x}:{top.y},scale=1080:960[ctop];"
+        f"[vbot]crop={bottom.width}:{bottom.height}:{bottom.x}:{bottom.y},scale=1080:960[cbottom];"
+        f"[ctop][cbottom]vstack=inputs=2,ass={ass_arg}[outv]"
+    )
 
 
 def _escape_filter_path(path: Path) -> str:
